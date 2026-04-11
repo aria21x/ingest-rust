@@ -2,7 +2,10 @@
 nixPkgs = ["cargo", "rustc", "pkg-config", "openssl"]
 
 [phases.build]
-cmds = ["cargo build --release"]
+cmds = [
+    "rustup default 1.85.0",
+    "cargo build --release"
+]
 
 [start]
 cmd = "./target/release/ingest-rust"
