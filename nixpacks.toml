@@ -1,0 +1,8 @@
+[phases.setup]
+nixPkgs = ["cargo", "rustc", "pkg-config", "openssl"]
+
+[phases.build]
+cmds = ["cargo build --release"]
+
+[start]
+cmd = "./target/release/ingest-rust"
