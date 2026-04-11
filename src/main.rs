@@ -1,16 +1,13 @@
 use anyhow::{Context, Result};
-use bb8::{Pool, PooledConnection};
+use bb8::{Pool};
 use bb8_postgres::PostgresConnectionManager;
 use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize};
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
 use tokio_postgres::NoTls;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{debug, error, info, warn};
-
-// Use rustls for WebSocket (avoid OpenSSL)
-type WebSocketStream = tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>;
 
 #[derive(Debug, Deserialize)]
 struct SubscriptionResult {
@@ -64,7 +61,6 @@ async fn main() -> Result<()> {
 
     let config = Config::from_env()?;
 
-    // Setup Postgres connection pool
     let manager = PostgresConnectionManager::new(
         config.database_url.parse()?,
         NoTls,
@@ -72,10 +68,8 @@ async fn main() -> Result<()> {
     let pool = Pool::builder().build(manager).await?;
     info!("Postgres pool created");
 
-    // Ensure raw_signatures table exists
     init_db(&pool).await?;
 
-    // Main loop with reconnect
     loop {
         match run_ingest(&config, &pool).await {
             Ok(()) => {
@@ -98,7 +92,9 @@ async fn init_db(pool: &Pool<PostgresConnectionManager<NoTls>>) -> Result<()> {
             signature TEXT NOT NULL UNIQUE,
             slot BIGINT NOT NULL,
             block_time TIMESTAMPTZ,
-            ingested_at TIMESTAMPTZ DEFAULT NOW()
+            ingested_at TIMESTAMPTZ DEFAULT NOW(),
+            processed BOOLEAN DEFAULT FALSE,
+            error_count INTEGER DEFAULT 0
         )",
         &[],
     )
@@ -113,7 +109,6 @@ async fn run_ingest(config: &Config, pool: &Pool<PostgresConnectionManager<NoTls
 
     let (mut write, mut read) = ws_stream.split();
 
-    // Subscribe to transactionSubscribe
     let subscribe_msg = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -125,7 +120,6 @@ async fn run_ingest(config: &Config, pool: &Pool<PostgresConnectionManager<NoTls
     });
     write.send(Message::Text(subscribe_msg.to_string())).await?;
 
-    // Wait for subscription confirmation
     if let Some(Ok(Message::Text(text))) = timeout(Duration::from_secs(10), read.next()).await? {
         let sub_resp: SubscriptionResult = serde_json::from_str(&text)?;
         if let Some(err) = sub_resp.error {
@@ -136,13 +130,11 @@ async fn run_ingest(config: &Config, pool: &Pool<PostgresConnectionManager<NoTls
         anyhow::bail!("Subscription confirmation timeout");
     }
 
-    // Main message loop
     let mut last_ping = tokio::time::Instant::now();
     loop {
         let msg = timeout(Duration::from_secs(60), read.next()).await?;
         match msg {
             Some(Ok(Message::Text(text))) => {
-                // Handle transaction notification
                 if let Ok(notif) = serde_json::from_str::<TransactionNotification>(&text) {
                     let sig = &notif.params.result.signature;
                     let slot = notif.params.result.slot;
@@ -153,18 +145,29 @@ async fn run_ingest(config: &Config, pool: &Pool<PostgresConnectionManager<NoTls
                         error!("Failed to insert signature {}: {}", sig, e);
                     }
                 } else {
-                    // Could be a ping or other message
-                    debug!("Non-transaction message: {}", text);
+                    debug!("Non-transaction text message: {}", text);
                 }
+                last_ping = tokio::time::Instant::now();
+            }
+            Some(Ok(Message::Binary(data))) => {
+                debug!("Received binary message of length {}", data.len());
                 last_ping = tokio::time::Instant::now();
             }
             Some(Ok(Message::Ping(data))) => {
                 write.send(Message::Pong(data)).await?;
                 last_ping = tokio::time::Instant::now();
             }
+            Some(Ok(Message::Pong(_))) => {
+                debug!("Received pong");
+                last_ping = tokio::time::Instant::now();
+            }
             Some(Ok(Message::Close(frame))) => {
                 warn!("WebSocket closed: {:?}", frame);
                 break;
+            }
+            Some(Ok(Message::Frame(_))) => {
+                // Raw frame - ignore
+                last_ping = tokio::time::Instant::now();
             }
             Some(Err(e)) => {
                 error!("WebSocket error: {}", e);
@@ -173,7 +176,6 @@ async fn run_ingest(config: &Config, pool: &Pool<PostgresConnectionManager<NoTls
             None => break,
         }
 
-        // Keepalive: send ping if idle for >20s
         if last_ping.elapsed() > Duration::from_secs(20) {
             write.send(Message::Ping(vec![])).await?;
             last_ping = tokio::time::Instant::now();
@@ -191,7 +193,6 @@ async fn insert_signature(
 ) -> Result<()> {
     let conn = pool.get().await?;
     let block_time = timestamp.map(|ts| chrono::DateTime::from_timestamp(ts, 0));
-    // Use ON CONFLICT DO NOTHING to ignore duplicates
     conn.execute(
         "INSERT INTO raw_signatures (signature, slot, block_time)
          VALUES ($1, $2, $3)
