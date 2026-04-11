@@ -9,7 +9,7 @@ use tokio_postgres::NoTls;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{debug, error, info, warn};
 
-// Verified program IDs (major DEXes)
+// Verified program IDs (major DEXes) to monitor via logsSubscribe
 const KNOWN_PROGRAMS: &[&str] = &[
     "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",   // Jupiter v6
     "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",   // Raydium AMM
@@ -24,22 +24,21 @@ struct SubscriptionResult {
 }
 
 #[derive(Debug, Deserialize)]
-struct TransactionNotification {
-    params: TransactionParams,
+struct LogsNotification {
+    params: LogsParams,
 }
 
 #[derive(Debug, Deserialize)]
-struct TransactionParams {
-    result: TransactionResult,
+struct LogsParams {
+    result: LogsResult,
     subscription: u64,
 }
 
 #[derive(Debug, Deserialize)]
-struct TransactionResult {
+struct LogsResult {
     signature: String,
-    slot: u64,
-    #[serde(default)]
-    timestamp: Option<i64>,
+    err: Option<serde_json::Value>,
+    logs: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -120,44 +119,39 @@ async fn run_ingest(config: &Config, pool: &Pool<PostgresConnectionManager<NoTls
 
     let (mut write, mut read) = ws_stream.split();
 
+    // Subscribe to logs from known program IDs
     let subscribe_msg = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "transactionSubscribe",
+        "method": "logsSubscribe",
         "params": [
-            {
-                "vote": false,
-                "failed": false,
-                "accountInclude": KNOWN_PROGRAMS,
-            },
-            {
-                "commitment": "confirmed",
-                "encoding": "jsonParsed",
-                "transactionDetails": "signatures"
-            }
+            { "mentions": KNOWN_PROGRAMS },
+            { "commitment": "confirmed" }
         ]
     });
     write.send(Message::Text(subscribe_msg.to_string())).await?;
 
     let sub_id = wait_for_subscription_confirmation(&mut read).await?;
-    info!("Subscription confirmed with id: {}", sub_id);
+    info!("Logs subscription confirmed with id: {}", sub_id);
 
     let mut last_ping = tokio::time::Instant::now();
     loop {
         let msg = timeout(Duration::from_secs(60), read.next()).await?;
         match msg {
             Some(Ok(Message::Text(text))) => {
-                if let Ok(notif) = serde_json::from_str::<TransactionNotification>(&text) {
+                // Try to parse as logs notification
+                if let Ok(notif) = serde_json::from_str::<LogsNotification>(&text) {
                     let sig = &notif.params.result.signature;
-                    let slot = notif.params.result.slot;
-                    let timestamp = notif.params.result.timestamp;
+                    // For logsSubscribe, slot is not provided; we can set it to 0 or fetch later
+                    let slot = 0u64;
+                    let timestamp = None; // Not provided by logsSubscribe
 
-                    debug!("Received signature: {}", sig);
+                    debug!("Received log signature: {}", sig);
                     if let Err(e) = insert_signature(pool, sig, slot, timestamp).await {
                         error!("Failed to insert signature {}: {}", sig, e);
                     }
                 } else {
-                    debug!("Non-transaction text message: {}", text);
+                    debug!("Non-logs text message: {}", text);
                 }
                 last_ping = tokio::time::Instant::now();
             }
