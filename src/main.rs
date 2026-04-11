@@ -9,6 +9,19 @@ use tokio_postgres::NoTls;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{debug, error, info, warn};
 
+// Known program IDs to monitor (major DEXes and launchpads)
+const KNOWN_PROGRAMS: &[&str] = &[
+    "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",   // Jupiter v6
+    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",   // Raydium
+    "9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTPhpBXbY",   // Orca
+    "METEORv2qpRMnzL4yHz5bH2kZzKp7hQkL5B2X5Zz5J5",   // Meteora
+    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",   // Pump.fun
+    "MoonCVVUTFSYwR3zFzXJQkZzH2Zv5Z5Z5Z5Z5Z5Z5Z5",   // Moonshot
+    "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",   // Whirlpool (Orca)
+    "SSwpkEEcbUqx4vtoEByFjSkhKdCT862DNVb52nZg1UZ",   // Saber
+    "Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB",   // Marinade
+];
+
 #[derive(Debug, Deserialize)]
 struct SubscriptionResult {
     result: serde_json::Value,
@@ -114,13 +127,22 @@ async fn run_ingest(config: &Config, pool: &Pool<PostgresConnectionManager<NoTls
 
     let (mut write, mut read) = ws_stream.split();
 
+    // Filter to transactions involving known DEX program IDs
     let subscribe_msg = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "transactionSubscribe",
         "params": [
-            { "vote": false, "failed": false, "accountInclude": [] },
-            { "commitment": "confirmed", "encoding": "jsonParsed", "transactionDetails": "signatures" }
+            {
+                "vote": false,
+                "failed": false,
+                "accountInclude": KNOWN_PROGRAMS,
+            },
+            {
+                "commitment": "confirmed",
+                "encoding": "jsonParsed",
+                "transactionDetails": "signatures"
+            }
         ]
     });
     write.send(Message::Text(subscribe_msg.to_string())).await?;
@@ -134,7 +156,6 @@ async fn run_ingest(config: &Config, pool: &Pool<PostgresConnectionManager<NoTls
         let msg = timeout(Duration::from_secs(60), read.next()).await?;
         match msg {
             Some(Ok(Message::Text(text))) => {
-                // Try to parse as transaction notification
                 if let Ok(notif) = serde_json::from_str::<TransactionNotification>(&text) {
                     let sig = &notif.params.result.signature;
                     let slot = notif.params.result.slot;
@@ -145,7 +166,6 @@ async fn run_ingest(config: &Config, pool: &Pool<PostgresConnectionManager<NoTls
                         error!("Failed to insert signature {}: {}", sig, e);
                     }
                 } else {
-                    // Might be other messages (ping, slot update, etc.)
                     debug!("Non-transaction text message: {}", text);
                 }
                 last_ping = tokio::time::Instant::now();
@@ -181,8 +201,6 @@ async fn run_ingest(config: &Config, pool: &Pool<PostgresConnectionManager<NoTls
 async fn wait_for_subscription_confirmation(
     read: &mut (impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin),
 ) -> Result<u64> {
-    // Helius may send a subscription response with a numeric result (the subscription ID)
-    // or a notification with slot info. We'll read until we get a valid response.
     loop {
         let msg = timeout(Duration::from_secs(10), read.next())
             .await?
@@ -191,30 +209,24 @@ async fn wait_for_subscription_confirmation(
         if let Message::Text(text) = msg {
             info!("Raw subscription response: {}", text);
 
-            // Try to parse as JSON-RPC response with "result" field
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-                // If it has an "error" field, bail
                 if let Some(err) = json.get("error") {
                     anyhow::bail!("Subscription error: {}", err);
                 }
-                // If it has a "result" field that's a number, that's our subscription ID
                 if let Some(result) = json.get("result") {
                     if let Some(id) = result.as_u64() {
                         return Ok(id);
                     } else {
-                        // Result might be an object; we'll accept it anyway
                         info!("Subscription result is not a number: {:?}", result);
-                        return Ok(0); // placeholder
+                        return Ok(0);
                     }
                 }
-                // If it has "method" == "slotNotification" or similar, ignore and continue
                 if json.get("method").is_some() {
                     debug!("Received notification before subscription confirmation, continuing...");
                     continue;
                 }
             }
         }
-        // If we get here, the message didn't match expected patterns; try again
         warn!("Unexpected message while waiting for subscription confirmation");
     }
 }
