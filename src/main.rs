@@ -9,12 +9,8 @@ use tokio_postgres::NoTls;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{debug, error, info, warn};
 
-// Verified program IDs (major DEXes) to monitor via logsSubscribe
-const KNOWN_PROGRAMS: &[&str] = &[
-    "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",   // Jupiter v6
-    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",   // Raydium AMM
-    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",   // Pump.fun
-];
+// Single program ID to monitor (Pump.fun - meme coin launches and initial trades)
+const MONITORED_PROGRAM: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 
 #[derive(Debug, Deserialize)]
 struct SubscriptionResult {
@@ -119,13 +115,13 @@ async fn run_ingest(config: &Config, pool: &Pool<PostgresConnectionManager<NoTls
 
     let (mut write, mut read) = ws_stream.split();
 
-    // Subscribe to logs from known program IDs
+    // Subscribe to logs from a single program (mentions expects a string, not array)
     let subscribe_msg = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "logsSubscribe",
         "params": [
-            { "mentions": KNOWN_PROGRAMS },
+            { "mentions": MONITORED_PROGRAM },
             { "commitment": "confirmed" }
         ]
     });
@@ -139,12 +135,10 @@ async fn run_ingest(config: &Config, pool: &Pool<PostgresConnectionManager<NoTls
         let msg = timeout(Duration::from_secs(60), read.next()).await?;
         match msg {
             Some(Ok(Message::Text(text))) => {
-                // Try to parse as logs notification
                 if let Ok(notif) = serde_json::from_str::<LogsNotification>(&text) {
                     let sig = &notif.params.result.signature;
-                    // For logsSubscribe, slot is not provided; we can set it to 0 or fetch later
-                    let slot = 0u64;
-                    let timestamp = None; // Not provided by logsSubscribe
+                    let slot = 0u64; // logsSubscribe doesn't provide slot; worker will fetch
+                    let timestamp = None;
 
                     debug!("Received log signature: {}", sig);
                     if let Err(e) = insert_signature(pool, sig, slot, timestamp).await {
