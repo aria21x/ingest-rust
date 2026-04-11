@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
-use bb8::{Pool};
+use bb8::Pool;
 use bb8_postgres::PostgresConnectionManager;
 use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize};
+use serde::Deserialize;
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
 use tokio_postgres::NoTls;
@@ -120,12 +120,20 @@ async fn run_ingest(config: &Config, pool: &Pool<PostgresConnectionManager<NoTls
     });
     write.send(Message::Text(subscribe_msg.to_string())).await?;
 
-    if let Some(Ok(Message::Text(text))) = timeout(Duration::from_secs(10), read.next()).await? {
-        let sub_resp: SubscriptionResult = serde_json::from_str(&text)?;
-        if let Some(err) = sub_resp.error {
-            anyhow::bail!("Subscription error: {:?}", err);
+    // Wait for subscription confirmation
+    if let Some(Ok(msg)) = timeout(Duration::from_secs(10), read.next()).await? {
+        match msg {
+            Message::Text(text) => {
+                let sub_resp: SubscriptionResult = serde_json::from_str(&text)?;
+                if let Some(err) = sub_resp.error {
+                    anyhow::bail!("Subscription error: {:?}", err);
+                }
+                info!("Subscription confirmed: {:?}", sub_resp.result);
+            }
+            other => {
+                anyhow::bail!("Unexpected subscription response: {:?}", other);
+            }
         }
-        info!("Subscription confirmed: {:?}", sub_resp.result);
     } else {
         anyhow::bail!("Subscription confirmation timeout");
     }
@@ -149,33 +157,27 @@ async fn run_ingest(config: &Config, pool: &Pool<PostgresConnectionManager<NoTls
                 }
                 last_ping = tokio::time::Instant::now();
             }
-            Some(Ok(Message::Binary(data))) => {
-                debug!("Received binary message of length {}", data.len());
-                last_ping = tokio::time::Instant::now();
-            }
             Some(Ok(Message::Ping(data))) => {
                 write.send(Message::Pong(data)).await?;
-                last_ping = tokio::time::Instant::now();
-            }
-            Some(Ok(Message::Pong(_))) => {
-                debug!("Received pong");
                 last_ping = tokio::time::Instant::now();
             }
             Some(Ok(Message::Close(frame))) => {
                 warn!("WebSocket closed: {:?}", frame);
                 break;
             }
-            Some(Ok(Message::Frame(_))) => {
-                // Raw frame - ignore
-                last_ping = tokio::time::Instant::now();
-            }
             Some(Err(e)) => {
                 error!("WebSocket error: {}", e);
                 break;
             }
             None => break,
+            // Catch-all for any other message types (Binary, Pong, Frame)
+            _ => {
+                last_ping = tokio::time::Instant::now();
+                continue;
+            }
         }
 
+        // Send ping to keep connection alive
         if last_ping.elapsed() > Duration::from_secs(20) {
             write.send(Message::Ping(vec![])).await?;
             last_ping = tokio::time::Instant::now();
