@@ -59,6 +59,11 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // Install Rustls crypto provider (required for rustls 0.23+)
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
     let config = Config::from_env()?;
 
     let manager = PostgresConnectionManager::new(
