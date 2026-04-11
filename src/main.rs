@@ -59,7 +59,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    // Install Rustls crypto provider (required for rustls 0.23+)
+    // Install Rustls crypto provider
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("Failed to install rustls crypto provider");
@@ -125,29 +125,16 @@ async fn run_ingest(config: &Config, pool: &Pool<PostgresConnectionManager<NoTls
     });
     write.send(Message::Text(subscribe_msg.to_string())).await?;
 
-    // Wait for subscription confirmation
-    if let Some(Ok(msg)) = timeout(Duration::from_secs(10), read.next()).await? {
-        match msg {
-            Message::Text(text) => {
-                let sub_resp: SubscriptionResult = serde_json::from_str(&text)?;
-                if let Some(err) = sub_resp.error {
-                    anyhow::bail!("Subscription error: {:?}", err);
-                }
-                info!("Subscription confirmed: {:?}", sub_resp.result);
-            }
-            other => {
-                anyhow::bail!("Unexpected subscription response: {:?}", other);
-            }
-        }
-    } else {
-        anyhow::bail!("Subscription confirmation timeout");
-    }
+    // Wait for subscription confirmation with flexible parsing
+    let sub_id = wait_for_subscription_confirmation(&mut read).await?;
+    info!("Subscription confirmed with id: {}", sub_id);
 
     let mut last_ping = tokio::time::Instant::now();
     loop {
         let msg = timeout(Duration::from_secs(60), read.next()).await?;
         match msg {
             Some(Ok(Message::Text(text))) => {
+                // Try to parse as transaction notification
                 if let Ok(notif) = serde_json::from_str::<TransactionNotification>(&text) {
                     let sig = &notif.params.result.signature;
                     let slot = notif.params.result.slot;
@@ -158,6 +145,7 @@ async fn run_ingest(config: &Config, pool: &Pool<PostgresConnectionManager<NoTls
                         error!("Failed to insert signature {}: {}", sig, e);
                     }
                 } else {
+                    // Might be other messages (ping, slot update, etc.)
                     debug!("Non-transaction text message: {}", text);
                 }
                 last_ping = tokio::time::Instant::now();
@@ -175,14 +163,12 @@ async fn run_ingest(config: &Config, pool: &Pool<PostgresConnectionManager<NoTls
                 break;
             }
             None => break,
-            // Catch-all for any other message types (Binary, Pong, Frame)
             _ => {
                 last_ping = tokio::time::Instant::now();
                 continue;
             }
         }
 
-        // Send ping to keep connection alive
         if last_ping.elapsed() > Duration::from_secs(20) {
             write.send(Message::Ping(vec![])).await?;
             last_ping = tokio::time::Instant::now();
@@ -190,6 +176,47 @@ async fn run_ingest(config: &Config, pool: &Pool<PostgresConnectionManager<NoTls
     }
 
     Ok(())
+}
+
+async fn wait_for_subscription_confirmation(
+    read: &mut (impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin),
+) -> Result<u64> {
+    // Helius may send a subscription response with a numeric result (the subscription ID)
+    // or a notification with slot info. We'll read until we get a valid response.
+    loop {
+        let msg = timeout(Duration::from_secs(10), read.next())
+            .await?
+            .context("WebSocket closed before subscription confirmation")??;
+
+        if let Message::Text(text) = msg {
+            info!("Raw subscription response: {}", text);
+
+            // Try to parse as JSON-RPC response with "result" field
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                // If it has an "error" field, bail
+                if let Some(err) = json.get("error") {
+                    anyhow::bail!("Subscription error: {}", err);
+                }
+                // If it has a "result" field that's a number, that's our subscription ID
+                if let Some(result) = json.get("result") {
+                    if let Some(id) = result.as_u64() {
+                        return Ok(id);
+                    } else {
+                        // Result might be an object; we'll accept it anyway
+                        info!("Subscription result is not a number: {:?}", result);
+                        return Ok(0); // placeholder
+                    }
+                }
+                // If it has "method" == "slotNotification" or similar, ignore and continue
+                if json.get("method").is_some() {
+                    debug!("Received notification before subscription confirmation, continuing...");
+                    continue;
+                }
+            }
+        }
+        // If we get here, the message didn't match expected patterns; try again
+        warn!("Unexpected message while waiting for subscription confirmation");
+    }
 }
 
 async fn insert_signature(
