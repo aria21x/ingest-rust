@@ -9,17 +9,11 @@ use tokio_postgres::NoTls;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{debug, error, info, warn};
 
-// Known program IDs to monitor (major DEXes and launchpads)
+// Verified program IDs (major DEXes)
 const KNOWN_PROGRAMS: &[&str] = &[
     "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",   // Jupiter v6
-    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",   // Raydium
-    "9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTPhpBXbY",   // Orca
-    "METEORv2qpRMnzL4yHz5bH2kZzKp7hQkL5B2X5Zz5J5",   // Meteora
+    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",   // Raydium AMM
     "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",   // Pump.fun
-    "MoonCVVUTFSYwR3zFzXJQkZzH2Zv5Z5Z5Z5Z5Z5Z5Z5",   // Moonshot
-    "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",   // Whirlpool (Orca)
-    "SSwpkEEcbUqx4vtoEByFjSkhKdCT862DNVb52nZg1UZ",   // Saber
-    "Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB",   // Marinade
 ];
 
 #[derive(Debug, Deserialize)]
@@ -72,7 +66,6 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    // Install Rustls crypto provider
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("Failed to install rustls crypto provider");
@@ -127,7 +120,6 @@ async fn run_ingest(config: &Config, pool: &Pool<PostgresConnectionManager<NoTls
 
     let (mut write, mut read) = ws_stream.split();
 
-    // Filter to transactions involving known DEX program IDs
     let subscribe_msg = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -147,7 +139,6 @@ async fn run_ingest(config: &Config, pool: &Pool<PostgresConnectionManager<NoTls
     });
     write.send(Message::Text(subscribe_msg.to_string())).await?;
 
-    // Wait for subscription confirmation with flexible parsing
     let sub_id = wait_for_subscription_confirmation(&mut read).await?;
     info!("Subscription confirmed with id: {}", sub_id);
 
